@@ -1,130 +1,131 @@
-import logging
 import os
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes
-from woocommerce import API
-from dotenv import load_dotenv
+import logging
+import requests
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InputFile
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler
 
-# بارگذاری متغیرهای محیطی
-load_dotenv()
+# فعال‌سازی لاگ برای خطایابی
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-WC_URL = os.getenv("WC_URL")
-WC_KEY = os.getenv("WC_KEY")
-WC_SECRET = os.getenv("WC_SECRET")
-
-# تنظیم ووکامرس
-wcapi = API(
-    url=WC_URL,
-    consumer_key=WC_KEY,
-    consumer_secret=WC_SECRET,
-    version="wc/v3"
-)
+# متغیرهای API ووکامرس
+WC_URL = "https://menupich.ir/cafeuka/wp-json/wc/v3"
+WC_KEY = os.environ.get("WC_KEY")
+WC_SECRET = os.environ.get("WC_SECRET")
 
 # مراحل گفتگو
-(NAME, PRICE, SHORT_DESC, CATEGORY, PHOTO) = range(5)
+(NAME, DESCRIPTION, CHOOSE_CATEGORY, NEW_CATEGORY, PRODUCT_IMAGE) = range(5)
 
-# فعال‌سازی لاگ‌ها
-logging.basicConfig(level=logging.INFO)
-
-# شروع ساخت محصول
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("سلام! نام محصول را وارد کنید:")
+# شروع گفتگو
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text("لطفاً نام محصول را وارد کنید:")
     return NAME
 
-async def name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["name"] = update.message.text
-    await update.message.reply_text("قیمت محصول را وارد کنید (فقط عدد):")
-    return PRICE
+def get_categories():
+    url = f"{WC_URL}/products/categories"
+    response = requests.get(url, auth=(WC_KEY, WC_SECRET))
+    if response.status_code == 200:
+        return response.json()
+    return []
 
-async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["price"] = update.message.text
-    await update.message.reply_text("توضیح کوتاه محصول را وارد کنید:")
-    return SHORT_DESC
+def ask_category(update: Update, context: CallbackContext):
+    categories = get_categories()
+    category_names = [cat["name"] for cat in categories]
+    keyboard = [[name] for name in category_names]
+    keyboard.append(["➕ ساخت دسته‌بندی جدید"])
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    update.message.reply_text("یکی از دسته‌بندی‌های زیر را انتخاب کنید یا گزینه ساخت را بزنید:", reply_markup=reply_markup)
+    return CHOOSE_CATEGORY
 
-async def short_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["short_desc"] = update.message.text
-    await update.message.reply_text("نام دسته‌بندی محصول را وارد کنید:")
-    return CATEGORY
+def handle_name(update: Update, context: CallbackContext):
+    context.user_data['name'] = update.message.text
+    update.message.reply_text("توضیح کوتاه محصول را وارد کنید:")
+    return DESCRIPTION
 
-async def category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def handle_description(update: Update, context: CallbackContext):
+    context.user_data['description'] = update.message.text
+    return ask_category(update, context)
+
+def handle_category_choice(update: Update, context: CallbackContext):
+    text = update.message.text
+    if text == "➕ ساخت دسته‌بندی جدید":
+        update.message.reply_text("نام دسته‌بندی جدید را وارد کنید:")
+        return NEW_CATEGORY
+    else:
+        context.user_data["category_name"] = text
+        update.message.reply_text("لطفاً عکس محصول را ارسال کنید:")
+        return PRODUCT_IMAGE
+
+def create_new_category(name):
+    url = f"{WC_URL}/products/categories"
+    data = {"name": name}
+    response = requests.post(url, auth=(WC_KEY, WC_SECRET), json=data)
+    return response.status_code == 201
+
+def handle_new_category(update: Update, context: CallbackContext):
     category_name = update.message.text
-    context.user_data["category"] = category_name
+    success = create_new_category(category_name)
+    if success:
+        context.user_data["category_name"] = category_name
+        update.message.reply_text("دسته‌بندی با موفقیت ساخته شد. لطفاً عکس محصول را ارسال کنید:")
+        return PRODUCT_IMAGE
+    else:
+        update.message.reply_text("ساخت دسته‌بندی با خطا مواجه شد. لطفاً دوباره تلاش کنید.")
+        return NEW_CATEGORY
 
-    # بررسی اینکه آیا دسته‌بندی وجود دارد
-    categories = wcapi.get("products/categories").json()
-    category_id = None
-    for cat in categories:
-        if cat["name"] == category_name:
-            category_id = cat["id"]
-            break
+def handle_photo(update: Update, context: CallbackContext):
+    photo = update.message.photo[-1].get_file()
+    photo_path = photo.download()
 
-    # اگر وجود نداشت، ایجاد کن
-    if not category_id:
-        data = {"name": category_name}
-        response = wcapi.post("products/categories", data).json()
-        category_id = response.get("id")
+    # آپلود عکس به سایت
+    media = {'file': open(photo_path, 'rb')}
+    response = requests.post(f"{WC_URL}/media", auth=(WC_KEY, WC_SECRET), files=media)
+    if response.status_code == 201:
+        image_url = response.json()["source_url"]
+    else:
+        update.message.reply_text("ارسال عکس با خطا مواجه شد.")
+        return ConversationHandler.END
 
-    context.user_data["category_id"] = category_id
-    await update.message.reply_text("لطفاً عکس محصول را ارسال کنید:")
-    return PHOTO
-
-async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    photo_bytes = await file.download_as_bytearray()
-
-    # آپلود عکس به ووکامرس از طریق REST API
-    import base64
-    import requests
-
-    # ابتدا عکس را در سایت آپلود می‌کنیم
-    media_url = f"{WC_URL}/wp-json/wp/v2/media"
-    headers = {
-        "Content-Disposition": "attachment; filename=product.jpg",
-        "Authorization": f"Basic {base64.b64encode(f'{WC_KEY}:{WC_SECRET}'.encode()).decode()}",
-        "Content-Type": "image/jpeg"
-    }
-    res = requests.post(media_url, headers=headers, data=photo_bytes)
-    image_data = res.json()
-    image_id = image_data.get("id")
-
-    # ساخت محصول نهایی
+    # ارسال اطلاعات محصول
     product_data = {
-        "name": context.user_data["name"],
-        "type": "simple",
-        "regular_price": context.user_data["price"],
-        "short_description": context.user_data["short_desc"],
-        "categories": [{"id": context.user_data["category_id"]}],
-        "images": [{"id": image_id}]
+        "name": context.user_data['name'],
+        "description": context.user_data['description'],
+        "images": [{"src": image_url}],
+        "categories": [{"name": context.user_data['category_name']}]
     }
 
-    wcapi.post("products", product_data)
+    product_res = requests.post(f"{WC_URL}/products", auth=(WC_KEY, WC_SECRET), json=product_data)
+    if product_res.status_code == 201:
+        update.message.reply_text("✅ محصول با موفقیت ساخته شد!")
+    else:
+        update.message.reply_text("❌ خطا در ساخت محصول.")
 
-    await update.message.reply_text("✅ محصول با موفقیت ساخته شد!")
     return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⛔ عملیات لغو شد.")
+def cancel(update: Update, context: CallbackContext):
+    update.message.reply_text("گفتگو لغو شد.")
     return ConversationHandler.END
 
-if __name__ == "__main__":
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+def main():
+    TOKEN = os.environ.get("BOT_TOKEN")
+    updater = Updater(TOKEN)
+    dp = updater.dispatcher
 
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[CommandHandler('start', start)],
         states={
-            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, name)],
-            PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, price)],
-            SHORT_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, short_desc)],
-            CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, category)],
-            PHOTO: [MessageHandler(filters.PHOTO, photo)],
+            NAME: [MessageHandler(Filters.text & ~Filters.command, handle_name)],
+            DESCRIPTION: [MessageHandler(Filters.text & ~Filters.command, handle_description)],
+            CHOOSE_CATEGORY: [MessageHandler(Filters.text & ~Filters.command, handle_category_choice)],
+            NEW_CATEGORY: [MessageHandler(Filters.text & ~Filters.command, handle_new_category)],
+            PRODUCT_IMAGE: [MessageHandler(Filters.photo, handle_photo)]
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler('cancel', cancel)]
     )
 
-    app.add_handler(conv_handler)
+    dp.add_handler(conv_handler)
+    updater.start_polling()
+    updater.idle()
 
-    print("ربات در حال اجراست...")
-    app.run_polling()
-
+if __name__ == '__main__':
+    main()
